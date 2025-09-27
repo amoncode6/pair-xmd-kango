@@ -4,19 +4,19 @@ let router = express.Router();
 const pino = require("pino");
 const { default: makeWASocket, useSingleFileAuthState, delay, Browsers, makeCacheableSignalKeyStore, DisconnectReason } = require('@whiskeysockets/baileys')
 
-// In-memory storage for sessions (for serverless)
+// In-memory storage for sessions
 const sessions = new Map();
 
 router.get('/', async (req, res) => {
     const id = makeid();
     let num = req.query.number;
-    
+
     if (!num) {
         return res.status(400).send({ error: "Phone number is required" });
     }
 
-    // Set timeout for Vercel (they have 10s timeout on free tier)
-    res.setTimeout(25000, () => {
+    // Set timeout for Vercel
+    res.setTimeout(30000, () => {
         if (!res.headersSent) {
             res.status(500).send({ error: "Request timeout" });
         }
@@ -24,50 +24,43 @@ router.get('/', async (req, res) => {
 
     async function KANGO_PAIR_CODE() {
         try {
-            // Use in-memory auth state for serverless
-            const { state, saveState } = useSingleFileAuthState(Buffer.from([]));
-            
-            var items = ["Safari", "Chrome", "Firefox"];
-            function selectRandomItem(array) {
-                var randomIndex = Math.floor(Math.random() * array.length);
-                return array[randomIndex];
-            }
-            var randomItem = selectRandomItem(items);
+            // Use in-memory auth state
+            const { state, saveState } = useSingleFileAuthState();
 
             let sock = makeWASocket({
                 auth: {
                     creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
                 },
                 printQRInTerminal: false,
-                logger: pino({ level: "fatal" }),
-                browser: Browsers.macOS(randomItem),
-                version: [2, 2413, 1],
-                // Serverless optimizations
+                logger: pino({ level: "silent" }),
+                browser: Browsers.macOS("Safari"),
+                // Remove version if causing issues
                 markOnlineOnConnect: false,
                 syncFullHistory: false,
                 transactionOpts: { maxCommitRetries: 1, delay: 100 }
             });
 
             if (!sock.authState.creds.registered) {
-                await delay(1000);
+                await delay(1500);
                 num = num.replace(/[^0-9]/g, '');
-                
+
                 try {
                     const code = await sock.requestPairingCode(num);
+                    console.log('Pairing code generated:', code);
+                    
                     if (!res.headersSent) {
-                        await res.send({ 
+                        res.send({ 
                             success: true, 
                             code: code,
-                            instructions: "Go to WhatsApp → Linked Devices → Link a Device → Link with phone number",
-                            note: "You have 30 seconds to enter the code"
+                            instructions: "Go to WhatsApp → Linked Devices → Link a Device → Link with phone number"
                         });
                     }
 
                     // Store session in memory
                     sessions.set(id, { sock, saveState });
 
-                    // Auto-cleanup after 30 seconds
+                    // Auto-cleanup after 45 seconds
                     setTimeout(() => {
                         if (sessions.has(id)) {
                             try {
@@ -75,14 +68,14 @@ router.get('/', async (req, res) => {
                                 sessions.delete(id);
                             } catch (e) {}
                         }
-                    }, 30000);
+                    }, 45000);
 
                 } catch (pairError) {
                     console.error("Pairing error:", pairError);
                     if (!res.headersSent) {
-                        await res.send({ 
+                        res.send({ 
                             success: false, 
-                            error: "Failed to generate pairing code. Try again." 
+                            error: "Failed to generate pairing code. Make sure the number is correct." 
                         });
                     }
                     return;
@@ -90,30 +83,26 @@ router.get('/', async (req, res) => {
             }
 
             sock.ev.on('creds.update', saveState);
-            
+
             sock.ev.on("connection.update", async (update) => {
                 const { connection, lastDisconnect } = update;
+                console.log('Connection update:', connection);
 
                 if (connection === "open") {
-                    if (!res.headersSent) {
-                        await res.send({ 
-                            success: true, 
-                            connected: true,
-                            message: "Successfully connected! Check your WhatsApp for session details."
-                        });
-                    }
-
-                    await delay(2000);
+                    console.log('Connected successfully');
+                    
+                    await delay(3000);
                     try {
-                        // Convert credentials to base64 for serverless
-                        const credsBase64 = Buffer.from(JSON.stringify(sock.authState.creds)).toString('base64');
-                        let sessionData = "KANGO~" + credsBase64;
+                        // Send simple session data
+                        const sessionData = "KANGO~" + Buffer.from(JSON.stringify(sock.authState.creds)).toString('base64');
                         
-                        await sock.sendMessage(sock.user.id, { text: sessionData });
-                        
+                        await sock.sendMessage(sock.user.id, { 
+                            text: `Session ID: ${sessionData.substring(0, 50)}...\n\nCheck your messages for full session data.`
+                        });
+
                         let desc = `*Hello there KANGO-XMD User! 👋🏻* 
 
-> Session generated successfully!
+✅ Session generated successfully!
 
 *Thanks for using KANGO-XMD 🚩* 
 
@@ -127,32 +116,45 @@ https://whatsapp.com/channel/0029Va8YUl50bIdtVMYnYd0E
                     } catch (e) {
                         console.error("Message error:", e);
                     }
-                    
+
                     // Close connection after sending session
-                    await delay(1000);
+                    await delay(2000);
                     try {
                         await sock.ws.close();
                         sessions.delete(id);
                     } catch (e) {}
-                    
+
                 } else if (connection === "close" && lastDisconnect) {
+                    console.log('Connection closed:', lastDisconnect.error);
                     const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                    
+
                     if (!shouldReconnect && sessions.has(id)) {
                         sessions.delete(id);
                     }
                 }
             });
-            
+
         } catch (err) {
             console.log("Service error:", err);
             if (!res.headersSent) {
-                await res.send({ success: false, error: "Service temporarily unavailable" });
+                res.send({ 
+                    success: false, 
+                    error: "Service temporarily unavailable. Please try again in a moment." 
+                });
             }
         }
     }
-    
-    return await KANGO_PAIR_CODE();
+
+    // Start the pairing process
+    KANGO_PAIR_CODE().catch(error => {
+        console.error('Unhandled error:', error);
+        if (!res.headersSent) {
+            res.status(500).send({ 
+                success: false, 
+                error: "Internal server error" 
+            });
+        }
+    });
 });
 
 module.exports = router;
